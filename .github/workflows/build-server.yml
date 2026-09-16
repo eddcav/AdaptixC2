@@ -1,0 +1,139 @@
+name: Build AdaptixC2 Server
+
+on:
+  push:
+    branches: [ testing-v2.0 ]
+  pull_request:
+    branches: [ testing-v2.0 ]
+  workflow_dispatch:          # 允许手动触发
+
+env:
+  GO_VERSION: '1.26.5'
+
+jobs:
+  build-server:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: testing-v2.0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            mingw-w64 \
+            g++-mingw-w64 \
+            gcc \
+            g++ \
+            make \
+            build-essential \
+            libssl-dev \
+            zlib1g-dev \
+            git \
+            wget \
+            ca-certificates
+
+      - name: Install go-win7 (for Gopher Agent Windows 7 support)
+        run: |
+          git clone --depth 1 https://github.com/Adaptix-Framework/go-win7 /tmp/go-win7
+          sudo rm -rf /usr/lib/go-win7
+          sudo mv /tmp/go-win7 /usr/lib/
+          sudo mkdir -p /usr/lib/go-win7/pkg/include
+          cd /usr/lib/go-win7/src/runtime
+          for f in *.h; do
+            sudo ln -sf /usr/lib/go-win7/src/runtime/$f /usr/lib/go-win7/pkg/include/$f
+          done
+          echo "[+] go-win7 installed"
+
+      - name: Build server + extenders
+        run: |
+          make server-ext
+          # 等价于：
+          # make server
+          # make extenders
+
+      - name: Generate self-signed certificate (optional)
+        run: |
+          cd dist
+          if [ -f ssl_gen.sh ]; then
+            chmod +x ssl_gen.sh
+            ./ssl_gen.sh || true
+          else
+            # 备用方案
+            openssl req -x509 -nodes -newkey rsa:2048 \
+              -keyout server.rsa.key \
+              -out server.rsa.crt \
+              -days 3650 \
+              -subj "/C=US/ST=State/L=City/O=AdaptixC2/CN=localhost"
+          fi
+
+      - name: Show build artifacts
+        run: |
+          echo "=== dist directory ==="
+          ls -lah dist/
+          echo ""
+          echo "=== extenders ==="
+          ls -lah dist/extenders/ || true
+          file dist/adaptixserver || true
+
+      - name: Upload server artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: adaptix-server-${{ github.sha }}
+          path: |
+            dist/adaptixserver
+            dist/profile.yaml
+            dist/404page.html
+            dist/ssl_gen.sh
+            dist/server.rsa.crt
+            dist/server.rsa.key
+            dist/extenders/
+          retention-days: 14
+          if-no-files-found: error
+
+  # 可选：使用 Docker 方式构建（更接近官方 Dockerfile）
+  build-server-docker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    if: github.event_name == 'workflow_dispatch'   # 仅手动触发时运行，节省 CI 时间
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: testing-v2.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build server + extenders via Docker Compose
+        run: |
+          docker compose --profile build-server-ext build
+          docker compose --profile build-server-ext up --abort-on-container-exit
+          docker compose --profile build-server-ext down
+
+      - name: Collect Docker build output
+        run: |
+          mkdir -p artifacts
+          if [ -d AdaptixServer/server-dist ]; then
+            cp -r AdaptixServer/server-dist/* artifacts/ || true
+          fi
+          ls -lah artifacts/
+
+      - name: Upload Docker-built artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: adaptix-server-docker-${{ github.sha }}
+          path: artifacts/
+          retention-days: 14
+          if-no-files-found: warn
